@@ -21,11 +21,14 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
   const [viewingPlayer, setViewingPlayer] = useState(player.id);
   const [roundAnswers, setRoundAnswers] = useState({});
   const [funLineIndex] = useState(() => Math.floor(Math.random() * 8));
+  // Manual marks override by host: { playerId_col: true/false } false = zeroed out
+  const [marksOverride, setMarksOverride] = useState({});
 
   const cycleRef = useRef(null);
   const countdownRef = useRef(null);
   const letterIndexRef = useRef(0);
   const currentLetterRef = useRef('');
+  const currentRoundRef = useRef(initialRoom.current_round);
   const firstDoneRef = useRef(null);
   const myDoneRef = useRef(false);
   const answersRef = useRef({});
@@ -35,6 +38,7 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
   const stopper = players[room.stopper_index] || null;
   const isSayer = sayer?.id === player.id;
   const isStopper = stopper?.id === player.id;
+  const isHost = room.host_id === player.id;
   const isLastRound = room.current_round >= room.total_rounds;
   const allFilled = columns.every(col => (answers[col] || '').trim());
 
@@ -64,7 +68,7 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
   };
 
   const fetchRoundAnswers = async () => {
-    const { data } = await supabase.from('answers').select('*').eq('room_id', room.id).eq('round', room.current_round);
+    const { data } = await supabase.from('answers').select('*').eq('room_id', room.id).eq('round', currentRoundRef.current);
     if (data) {
       const byPlayer = {};
       data.forEach(a => { byPlayer[a.player_id] = a; });
@@ -78,7 +82,26 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
     }
   };
 
+  const resetForNewRound = () => {
+    stopCycling();
+    if (countdownRef.current) { clearInterval(countdownRef.current); countdownRef.current = null; }
+    answersRef.current = {};
+    setAnswers({});
+    setLocked(false);
+    myDoneRef.current = false;
+    setMyDone(false);
+    firstDoneRef.current = null;
+    setFirstDone(null);
+    setCountdown(null);
+    setRoundAnswers({});
+    setShowScoreboard(false);
+    setMarksOverride({});
+    setViewingPlayer(player.id);
+    setPhase(PHASE.LETTER);
+  };
+
   const handleRoomUpdate = (updated) => {
+    // New letter revealed → switch to answer phase
     if (updated.current_letter && updated.current_letter !== currentLetterRef.current) {
       currentLetterRef.current = updated.current_letter;
       setCurrentLetter(updated.current_letter);
@@ -93,6 +116,18 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
       setFirstDone(null);
       setCountdown(null);
       setRoundAnswers({});
+    }
+
+    // ✅ FIX: host moved to next round → all non-host players reset and go back to letter phase
+    if (
+      updated.current_round > currentRoundRef.current &&
+      updated.status === 'playing' &&
+      (!updated.current_letter || updated.current_letter === null || updated.current_letter === '')
+    ) {
+      currentRoundRef.current = updated.current_round;
+      currentLetterRef.current = '';
+      setCurrentLetter('');
+      resetForNewRound();
     }
   };
 
@@ -169,13 +204,16 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
     await calculateScores();
   };
 
-  const calculateScores = async () => {
+  const calculateScores = async (overrides = {}) => {
     const { data: roundData } = await supabase.from('answers').select('*').eq('room_id', room.id).eq('round', room.current_round);
     if (!roundData) return;
     const scoreUpdates = {};
     columns.forEach(col => {
       const colAnswers = roundData.map(r => (r.answers?.[col] || '').trim().toLowerCase()).filter(Boolean);
       roundData.forEach(r => {
+        const key = `${r.player_id}_${col}`;
+        // If host zeroed this answer out, give 0
+        if (overrides[key] === false) return;
         const ans = (r.answers?.[col] || '').trim().toLowerCase();
         if (!ans) return;
         const count = colAnswers.filter(a => a === ans).length;
@@ -191,37 +229,53 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
     for (const p of (currentPlayers || [])) {
       await supabase.from('players').update({ score: p.score + (scoreUpdates[p.id] || 0) }).eq('id', p.id);
     }
+    await fetchPlayers();
     setPhase(PHASE.RESULTS);
   };
 
+  // Host toggles a specific answer cell to 0
+  const toggleMarkOverride = (playerId, col) => {
+    const key = `${playerId}_${col}`;
+    setMarksOverride(prev => ({ ...prev, [key]: prev[key] === false ? undefined : false }));
+  };
+
+  // Host confirms marks and recalculates
+  const handleConfirmMarks = async () => {
+    // Reset player scores for this round first, then recalculate
+    const { data: currentPlayers } = await supabase.from('players').select('*').eq('room_id', room.id);
+    const { data: roundData } = await supabase.from('answers').select('*').eq('room_id', room.id).eq('round', room.current_round);
+    // Subtract previously added marks
+    for (const r of (roundData || [])) {
+      const p = currentPlayers?.find(p => p.id === r.player_id);
+      if (p) await supabase.from('players').update({ score: Math.max(0, p.score - (r.total_marks || 0)) }).eq('id', p.id);
+    }
+    await calculateScores(marksOverride);
+  };
+
   const handleNextRound = async () => {
-    setShowScoreboard(false);
-    await fetchPlayers();
     const nextRound = room.current_round + 1;
     const newSayerIdx = (room.sayer_index + 1) % players.length;
     const newStopperIdx = (newSayerIdx + 1) % players.length;
+    // Reset current_letter to empty string so handleRoomUpdate on other clients detects new round
     await supabase.from('rooms').update({
       current_round: nextRound,
-      current_letter: null,
+      current_letter: '',
       sayer_index: newSayerIdx,
       stopper_index: newStopperIdx,
       status: 'playing',
     }).eq('id', room.id);
+    // Host also resets locally
+    currentRoundRef.current = nextRound;
     currentLetterRef.current = '';
-    setPhase(PHASE.LETTER);
     setCurrentLetter('');
-    setCountdown(null);
-    setMyDone(false);
-    setLocked(false);
-    setAnswers({});
-    answersRef.current = {};
+    resetForNewRound();
   };
 
   /* ===================== RENDER ===================== */
   return (
     <div style={{ width: '100%', minHeight: '100vh', padding: '0.6rem', boxSizing: 'border-box', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.6rem' }}>
 
-      {/* ── STATUS PILL ── */}
+      {/* STATUS PILL */}
       <div style={{
         width: '100%', maxWidth: 680,
         background: '#fffde8',
@@ -245,10 +299,10 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
             <span style={{ fontFamily: 'var(--font-note)', fontWeight: 700, fontSize: '1.2rem', color: '#e63946', minWidth: 36 }}>{countdown}s</span>
           </>
         )}
-        {phase === PHASE.RESULTS && <>📋 Round {room.current_round} answers — swipe tabs to see everyone</>}
+        {phase === PHASE.RESULTS && <>📋 Round {room.current_round} done — check answers below</>}
       </div>
 
-      {/* ── LETTER PHASE ── */}
+      {/* LETTER PHASE */}
       {phase === PHASE.LETTER && (
         <div style={{
           width: '100%', maxWidth: 380,
@@ -259,21 +313,15 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
           boxShadow: '3px 3px 0 #c9b882, 6px 6px 0 #b8a870',
           padding: '2rem 1.5rem',
           display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1.5rem',
-          minHeight: 220,
-          justifyContent: 'center',
+          minHeight: 220, justifyContent: 'center',
         }}>
           <div style={{ textAlign: 'center' }}>
             <div style={{ fontFamily: 'var(--font-note)', fontSize: '0.85rem', color: '#888', marginBottom: '0.5rem' }}>
               {isSayer ? 'Only you can see this 👁️' : isStopper ? 'Hit STOP whenever you want!' : `Waiting for ${stopper?.name || '...'} to stop`}
             </div>
             <div style={{
-              fontFamily: 'var(--font-note)',
-              fontSize: '7rem',
-              fontWeight: 700,
-              lineHeight: 1,
-              color: isSayer ? '#1a1a2e' : '#1a1a2e',
-              opacity: isSayer ? 1 : 0.15,
-              userSelect: 'none',
+              fontFamily: 'var(--font-note)', fontSize: '7rem', fontWeight: 700,
+              lineHeight: 1, color: '#1a1a2e', opacity: isSayer ? 1 : 0.15, userSelect: 'none',
             }}>
               {isSayer ? cyclingLetter : '?'}
             </div>
@@ -283,10 +331,15 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
               STOP!
             </button>
           )}
+          {!isSayer && !isStopper && (
+            <div style={{ fontFamily: 'var(--font-note)', color: '#888', fontStyle: 'italic', fontSize: '0.9rem' }}>
+              Waiting for <strong>{stopper?.name}</strong> to stop…
+            </div>
+          )}
         </div>
       )}
 
-      {/* ── ANSWER / RESULTS PHASE ── */}
+      {/* ANSWER / RESULTS PHASE */}
       {(phase === PHASE.ANSWER || phase === PHASE.RESULTS) && (
         <div style={{ width: '100%', maxWidth: 700 }}>
 
@@ -294,18 +347,17 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
           {phase === PHASE.RESULTS && (
             <div style={{ display: 'flex', gap: 4, overflowX: 'auto', paddingBottom: 2, marginBottom: -2, WebkitOverflowScrolling: 'touch' }}>
               {players.map(p => (
-                <button key={p.id}
-                  onClick={() => setViewingPlayer(p.id)}
-                  style={{
-                    fontFamily: 'var(--font-hand)', fontSize: '0.85rem',
-                    padding: '0.25rem 0.9rem',
-                    background: viewingPlayer === p.id ? '#fefde8' : '#f0e8c8',
-                    border: '2px solid #c9c07a', borderBottom: viewingPlayer === p.id ? '2px solid #fefde8' : '2px solid #c9c07a',
-                    borderRadius: '4px 4px 0 0',
-                    cursor: 'pointer', whiteSpace: 'nowrap',
-                    fontWeight: viewingPlayer === p.id ? 700 : 400,
-                    color: viewingPlayer === p.id ? '#1a1a2e' : '#666',
-                  }}>
+                <button key={p.id} onClick={() => setViewingPlayer(p.id)} style={{
+                  fontFamily: 'var(--font-hand)', fontSize: '0.85rem',
+                  padding: '0.25rem 0.9rem',
+                  background: viewingPlayer === p.id ? '#fefde8' : '#f0e8c8',
+                  border: '2px solid #c9c07a',
+                  borderBottom: viewingPlayer === p.id ? '2px solid #fefde8' : '2px solid #c9c07a',
+                  borderRadius: '4px 4px 0 0',
+                  cursor: 'pointer', whiteSpace: 'nowrap',
+                  fontWeight: viewingPlayer === p.id ? 700 : 400,
+                  color: viewingPlayer === p.id ? '#1a1a2e' : '#666',
+                }}>
                   {p.name}{p.id === player.id ? ' ✏️' : ''}
                 </button>
               ))}
@@ -322,7 +374,7 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
             overflow: 'hidden',
           }}>
 
-            {/* ── NOTEBOOK HEADER ── */}
+            {/* NOTEBOOK HEADER */}
             <div style={{
               borderBottom: '2px solid #1a1a2e',
               padding: '0.5rem 0.8rem',
@@ -332,7 +384,6 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
               gap: '0.4rem',
               background: 'rgba(255,253,232,0.95)',
             }}>
-              {/* Left: room + date */}
               <div style={{ minWidth: 0 }}>
                 <div style={{ fontFamily: 'var(--font-note)', fontSize: '0.88rem', fontWeight: 700, color: '#1a1a2e', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {room.name}
@@ -341,33 +392,25 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
                   {new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}
                 </div>
               </div>
-
-              {/* Centre: big letter + round */}
               <div style={{ textAlign: 'center', padding: '0 0.3rem' }}>
-                <div style={{
-                  fontFamily: 'var(--font-note)', fontSize: '2.8rem', fontWeight: 700,
-                  lineHeight: 1, color: '#1a1a2e',
-                }}>
+                <div style={{ fontFamily: 'var(--font-note)', fontSize: '2.8rem', fontWeight: 700, lineHeight: 1, color: '#1a1a2e' }}>
                   {currentLetter || '?'}
                 </div>
                 <div style={{ fontFamily: 'var(--font-note)', fontSize: '0.68rem', color: '#888', whiteSpace: 'nowrap' }}>
                   Round {room.current_round}/{room.total_rounds}
                 </div>
               </div>
-
-              {/* Right: player name */}
               <div style={{ textAlign: 'right', fontFamily: 'var(--font-note)', fontSize: '0.88rem', fontWeight: 700, color: '#1a1a2e', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {players.find(p => p.id === viewingPlayer)?.name || player.name}
               </div>
             </div>
 
-            {/* ── ANSWER ROWS — vertical stacked on mobile ── */}
+            {/* ANSWER GRID */}
             <div style={{ padding: '0.5rem 0.8rem 0.8rem' }}>
-
-              {/* Column headers row */}
+              {/* Column headers */}
               <div style={{
                 display: 'grid',
-                gridTemplateColumns: `48px repeat(${columns.length}, 1fr)`,
+                gridTemplateColumns: `44px repeat(${columns.length}, 1fr)`,
                 gap: '0 0.4rem',
                 marginBottom: '0.3rem',
                 borderBottom: '1px solid #1a1a2e',
@@ -382,26 +425,47 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
               {/* Answer row */}
               <div style={{
                 display: 'grid',
-                gridTemplateColumns: `48px repeat(${columns.length}, 1fr)`,
+                gridTemplateColumns: `44px repeat(${columns.length}, 1fr)`,
                 gap: '0 0.4rem',
                 alignItems: 'end',
               }}>
-                {/* Marks cell */}
+                {/* Marks */}
                 <div style={{
                   fontFamily: 'var(--font-note)', fontSize: '0.9rem', fontWeight: 700,
                   color: '#457b9d', paddingBottom: '0.25rem',
                   borderBottom: '1px solid #a8d5e2',
                   minHeight: 32, display: 'flex', alignItems: 'flex-end',
                 }}>
-                  {locked && roundAnswers[viewingPlayer] ? (roundAnswers[viewingPlayer]?.total_marks ?? '') : ''}
+                  {phase === PHASE.RESULTS && roundAnswers[viewingPlayer]
+                    ? (() => {
+                        // Recalc display marks with overrides
+                        const r = roundAnswers[viewingPlayer];
+                        if (!r) return '';
+                        let base = r.total_marks || 0;
+                        // Subtract zeroed cols (each unique = 10, common = 5 — approximate 10 per zeroed)
+                        Object.entries(marksOverride).forEach(([key, val]) => {
+                          if (val === false && key.startsWith(viewingPlayer)) base = Math.max(0, base - 10);
+                        });
+                        return base;
+                      })()
+                    : ''
+                  }
                 </div>
 
-                {/* Answer inputs / text */}
+                {/* Answer cells */}
                 {columns.map(col => {
                   const isMe = viewingPlayer === player.id;
                   const val = isMe ? (answers[col] || '') : (roundAnswers[viewingPlayer]?.answers?.[col] || '');
+                  const overrideKey = `${viewingPlayer}_${col}`;
+                  const isZeroed = marksOverride[overrideKey] === false;
+
                   return (
-                    <div key={col} style={{ borderBottom: '1px solid #a8d5e2', minHeight: 32 }}>
+                    <div key={col} style={{
+                      borderBottom: '1px solid #a8d5e2',
+                      minHeight: 32,
+                      position: 'relative',
+                      background: isZeroed ? 'rgba(230,57,70,0.08)' : 'transparent',
+                    }}>
                       {isMe && phase === PHASE.ANSWER ? (
                         <input
                           value={val}
@@ -411,16 +475,35 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
                           autoComplete="off" autoCorrect="off" autoCapitalize="words" spellCheck="false"
                           style={{
                             width: '100%', background: 'transparent', border: 'none', outline: 'none',
-                            fontFamily: 'var(--font-hand)', fontSize: '1rem', color: locked ? '#e63946' : '#1a1a2e',
+                            fontFamily: 'var(--font-hand)', fontSize: '1rem',
+                            color: locked ? '#e63946' : '#1a1a2e',
                             padding: '0.25rem 0.2rem', cursor: locked ? 'not-allowed' : 'text',
                           }}
                         />
                       ) : (
                         <div style={{
-                          fontFamily: 'var(--font-hand)', fontSize: '1rem', color: '#1a1a2e',
+                          fontFamily: 'var(--font-hand)', fontSize: '1rem',
+                          color: isZeroed ? '#e63946' : '#1a1a2e',
                           padding: '0.25rem 0.2rem', minHeight: 32,
+                          textDecoration: isZeroed ? 'line-through' : 'none',
+                          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
                         }}>
-                          {val}
+                          <span>{val}</span>
+                          {/* Host can tap any answer cell to zero it out */}
+                          {isHost && phase === PHASE.RESULTS && val && (
+                            <button
+                              onClick={() => toggleMarkOverride(viewingPlayer, col)}
+                              title={isZeroed ? 'Restore mark' : 'Zero this answer'}
+                              style={{
+                                background: isZeroed ? '#2a9d8f' : '#e63946',
+                                color: 'white', border: 'none',
+                                borderRadius: 3, fontSize: '0.65rem',
+                                padding: '1px 5px', cursor: 'pointer',
+                                marginLeft: 4, flexShrink: 0,
+                              }}>
+                              {isZeroed ? '✓' : '✗'}
+                            </button>
+                          )}
                         </div>
                       )}
                     </div>
@@ -429,13 +512,13 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
               </div>
             </div>
 
-            {/* ── FOOTER: action buttons ── */}
+            {/* FOOTER */}
             <div style={{
               borderTop: '1px dashed #c9c07a',
               padding: '0.6rem 0.8rem',
               display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem',
             }}>
-              {/* Left side — done / status */}
+              {/* Left — done/status */}
               <div>
                 {phase === PHASE.ANSWER && !myDone && !locked && (
                   <button className="btn btn-done" onClick={handleDone}
@@ -453,9 +536,17 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
                     🔒 Locked!
                   </span>
                 )}
+
+                {/* Host confirm marks button */}
+                {isHost && phase === PHASE.RESULTS && Object.values(marksOverride).some(v => v === false) && (
+                  <button className="btn btn-danger" onClick={handleConfirmMarks}
+                    style={{ fontSize: '0.82rem', padding: '0.35rem 0.8rem' }}>
+                    ✓ Confirm Marks
+                  </button>
+                )}
               </div>
 
-              {/* Right side — scores / next */}
+              {/* Right — scores / next */}
               {phase === PHASE.RESULTS && (
                 <div style={{ display: 'flex', gap: '0.5rem' }}>
                   <button className="btn" onClick={() => setShowScoreboard(true)}
@@ -468,7 +559,7 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
                       🏆 Final!
                     </button>
                   ) : (
-                    room.host_id === player.id && (
+                    isHost && (
                       <button className="btn btn-primary" onClick={handleNextRound}
                         style={{ fontSize: '0.82rem', padding: '0.35rem 0.9rem' }}>
                         Next Round →
@@ -479,17 +570,28 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
               )}
             </div>
           </div>
+
+          {/* Host hint for zeroing marks */}
+          {isHost && phase === PHASE.RESULTS && (
+            <div style={{
+              marginTop: '0.4rem', textAlign: 'center',
+              fontFamily: 'var(--font-note)', fontSize: '0.75rem',
+              color: '#888', fontStyle: 'italic'
+            }}>
+              Host: tap ✗ on any answer to mark it as invalid (zero marks)
+            </div>
+          )}
         </div>
       )}
 
-      {/* Scoreboard popup */}
+      {/* Scoreboard */}
       {showScoreboard && (
         <Scoreboard
           players={players}
           isFinal={isLastRound}
           currentLetter={currentLetter}
           funLineIndex={funLineIndex}
-          onNext={!isLastRound && room.host_id === player.id ? handleNextRound : null}
+          onNext={!isLastRound && isHost ? handleNextRound : null}
           onClose={() => {
             if (isLastRound) window.location.reload();
             else setShowScoreboard(false);
@@ -497,7 +599,6 @@ export default function GameScreen({ player, room: initialRoom, onRoomUpdate }) 
         />
       )}
 
-      {/* Voice */}
       <VoiceChat roomId={room.id} playerName={player.name} />
     </div>
   );
